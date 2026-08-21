@@ -1,0 +1,395 @@
+========================================================================
+BUG BOUNTY RECON SCRIPT SUITE - FULL ANALYSIS REPORT
+========================================================================
+Target directory    : /root/bugscripts
+Scripts analysed    : iprecon, fullrecon, techrecon, nmapscan, passivesubrecon,
+                      brutesubrecon, apirecon, checkcms, cleanamass, cleanurls,
+                      commixrecon, crawlrecon, dirrecon, findrecon, hunter,
+                      jsrecon, reconfilter, repeater, smugglerrecon, sqlrecon,
+                      urlfilter, urlrecon, xssrecon
+Also present        : reconpy.zip (Python re-implementation of the suite)
+Date                : 2026-08-11
+Author              : automated analysis
+
+HOW TO READ THIS REPORT
+------------------------------------------------------------------------
+Each script below lists:
+  [STATUS]    OK = works, PARTIAL = works but has room to improve,
+              FIX = has a bug / will not work as intended
+  [SEVERITY]  How urgently the issue should be addressed.
+  [PROBLEMS]  Concrete defects found.
+  [FIX]       Recommended change.
+
+At the end you will find: a HIGH-PRIORITY tools-to-install list, extra tools
+per attack surface, and a suggested optimal scan pipeline.
+
+========================================================================
+GLOBAL CROSS-CUTTING ISSUES (apply to many scripts)
+========================================================================
+1. Serial / single-threaded execution everywhere. Almost every script loops
+   with `-t 1`, `-threads 1`, `-c 1`, `-rate 5` and adds `sleep` between host
+   iterations. This is extremely slow. On targets allowed by the program you
+   can parallelise with xargs/parallel and raise tool concurrency.
+
+2. Every script truncates its OWN output file with `> "$FILE"` at the start.
+   When scripts are chained by fullrecon.sh, each overwrites instead of
+   appends, destroying prior work (e.g. multiple scripts write to urls.txt,
+   js.txt, ips.txt). Should be `>>` with a sorted union, not `>` truncate.
+
+3. No rate-limit / throttling awareness of the target. Always hammering with no
+   WAF detection and no backoff. Long `sleep N` is used as a crude throttle but
+   wastes enormous wall-clock time. Better: detect WAF once (wafw00f) and tune.
+
+4. No logging of errors separately; all `2>/dev/null` means silent failures are
+   invisible. Keep a per-run debug log.
+
+5. No confirmation that required tools exist (most scripts use `command -v` is
+   inconsistent). Several scripts silently produce empty results if a tool is
+   missing.
+
+6. hunter.sh is badly indented (tabs injected into every line) and its
+   `trap 'exit' INT` line breaks getopts; it must be rewritten.
+
+7. fullrecon.sh references scripts that may not exist: cmdirecon.sh is NOT
+   present on the system (only commixrecon.sh). Also BUG: fullrecon.sh lines
+   171 and 220 both read `findurls.txt` from jsrecon/findrecon, but jsrecon.sh
+   actually writes js.txt, not findurls.txt, so the merge is wrong. Also the
+   variable SCRIPT_DIR="/root/scripts" but the working copy is /root/bugscripts.
+
+8. global inconsistency: SCRIPT_DIR hardcoded to /root/scripts in fullrecon but
+   scripts live in /root/bugscripts. Should derive from script location.
+
+========================================================================
+DETAILED PER-SCRIPT ANALYSIS
+========================================================================
+
+--- 1. iprecon.sh -----------------------------------------------------
+[STATUS] PARTIAL
+[SEVERITY] HIGH - this is your IP-resolution core and the one you asked to fix.
+[PROBLEMS]
+  * Resolves the whole subdomain list, not the *alive* list, wasting DNS queries.
+  * httpx uses -threads 1 / -rate-limit 5 (very slow) and the grep/sed pipeline
+    to strip schemes also strips any host-on-port so "https://x:8443" -> "x".
+  * python socket resolver only does gethostbyname / getaddrinfo on the *default*
+    infra resolver -> cache poisoning / poisoned / stale records, and many
+    CDN-backed names resolve to anycast so the "real IP" is wrong.
+  * Only checks Cloudflare ranges. Misses Akamai, Fastly, Cloudfront, Incapsula,
+    Sucuri/StackPath, Google/OWD, Netlify, Vercel, StormWall, etc.
+  * HackerTarget/crt.sh lookups use host == sub but crt.sh does NOT return IPs
+    (cert transparency returns names, not addresses) so that part mostly yields
+    nothing.
+  * No historical-IP (Cert.sh SSL history, SecurityTrails, RiskIQ) harvesting.
+  * Cloudfail step depends on a tool (cloudfail) that is archived/unmaintained
+    and often broken; it is also not installed here.
+  * The final merge loops are correct but all collected data is re-fetched twice.
+  * Sequential `sleep 2-5` after every single request -> absurd runtime for a
+    large list.
+[FIX] See rewritten iprecon.sh delivered alongside this report.
+
+--- 2. fullrecon.sh ----------------------------------------------------
+[STATUS] FIX
+[SEVERITY] HIGH (orchestrator)
+[PROBLEMS]
+  * SCRIPT_DIR hardcoded to /root/scripts (wrong dir for this copy).
+  * References cmdirecon.sh which does not exist (should be commixrecon.sh).
+  * Merging jsrecon into findurls.txt is wrong (jsrecon writes js.txt).
+  * STEP 14-16 scan "parameters.txt" but parameters.txt is only produced by
+    urlrecon/urlfilter AFTER STEP 12; whether it exists depends on ordering that
+    may not hold; better to re-derive it from urls.txt each time.
+  * STEP 5 loops nmap over each IP sequentially (fine) but techrecon already
+    runs nmap, so you scan twice.
+  * No run timestamp / scoped-folder; all output dumped into CWD and may clobber.
+  * No check that DOMAIN is newline-safe; no notification/report aggregation.
+[FIX]
+  * Set SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd).
+  * Replace cmdirecon.sh with commixrecon.sh.
+  * Rework the js merge to use js.txt.
+  * Add a per-run output directory.
+  * Skip either nmapscan or techrecon nmap (or make it a flag).
+
+--- 3. techrecon.sh ----------------------------------------------------
+[STATUS] PARTIAL
+[SEVERITY] LOW-MEDIUM
+[PROBLEMS]
+  * Runs full nmap -sV -sC -O per target with a huge curated port list; that is
+    very slow and heavy. naabu pre-scan helps but full -O on every host is overkill.
+  * whatweb is run twice per target (once into RAW_ALL loop, once for WP check).
+  * webanalyze, cmseek, wafw00f, httpx are all fine but sequential.
+  * WordPress wpscan with --enumerate vp,vt,u,tt,cb,dbe hits enumeration and is
+    slow + noisy; fine but account-scoped.
+  * No skip of targets that are CDN-backed / out-of-scope.
+  * CMS detection only fires on limited CMS keyword set.
+[FIX]
+  * Run OS detection once, on unique IPs, not per URL.
+  * Run whatweb once. Parallelise per target with xargs -P.
+  * Gate heavy scans (wpscan/cmsmap) behind a flag.
+
+--- 4. nmapscan.sh ------------------------------------------------------
+[STATUS] PARTIAL
+[SEVERITY] MEDIUM
+[PROBLEMS]
+  * --script vuln can take hours and is extremely noisy; it is run full -p- when
+    naabu missing. Suggest --top-ports or -p known set instead of -p-.
+  * Single target at a time (fullrecon calls it in a loop per IP).
+  * No output of NSE category results other than vuln (auth, discovery etc.).
+  * The bash keyword matching is loose and may produce false positives, but the
+    python "State: VULNERABLE" parsing is good.
+[FIX]
+  * Add --defeat-icmp, --min-rate, use version-light.
+  * Optionally run script catagories: vuln,auth,discovery with a cap.
+
+--- 5. passivesubrecon.sh -----------------------------------------------
+[STATUS] PARTIAL
+[SEVERITY] MEDIUM
+[PROBLEMS]
+  * amass enum runs twice (-passive then -passive -ip) -> duplicate cost.
+  * sublist3r is slow and mostly redundant with subfinder+amass.
+  * haktrails requires auth token; else empty.
+  * Only dnsx resolution; missing additional passive sources: crt.sh, dnsdumpster,
+    RapidDNS, VirusTotal, AlienVault OTX, Shodan, SecurityTrails, censys.
+  * dnsx/httpx single-threaded; -rate-limit 5 very slow.
+  * Per-domain sequential with sleeps -> long runtime for many domains.
+[FIX]
+  * Use amass once with -ip, plus add crt.sh + otx + rapidDNS via subfinder sources.
+  * Add puredns + resolver file for better resolution.
+  * Parallelise across domains.
+
+--- 6. brutesubrecon.sh -------------------------------------------------
+[STATUS] PARTIAL
+[SEVERITY] MEDIUM
+[PROBLEMS]
+  * ffuf single-threaded rate 20 -> will take 30+ min even for a 50k wordlist on
+    HTTPS; fine as a cap but the default rate is very conservative.
+  * knockpy deprecated/unmaintained and slow.
+  * alterx requires existing subs to permute - good but limited.
+  * No puredns massdns based brute which is 100x faster.
+[FIX]
+  * Prefer puredns bruteforce && resolvers, or ffuf with -t 40 -rate 300.
+  * Add mutation via gotator/altdns in addition to alterx.
+
+--- 7. apirecon.sh -------------------------------------------------------
+[STATUS] PARTIAL
+[SEVERITY] MEDIUM
+[PROBLEMS]
+  * kiterunner is NOT installed (missing) - that whole block does nothing.
+  * Oracle/arjun/qsreplace/oralyzer/openredirex all good but sequential.
+  * No output if Oralyzer path (hardcoded /usr/local/bin) differs.
+  * qsreplace FUZZ loop curls each URL with sleep 3 -> slow.
+[FIX]
+  * Guard every tool with command -v.
+  * Parallelise arjun across targets; add nuclei -tags expose.
+  * Add JSON/API-specific discovery (see tool list).
+
+--- 8. checkcms.sh --------------------------------------------------------
+[STATUS] OK (self-contained, CH-Media specific)
+[SEVERITY] INFO
+[PROBLEMS]
+  * Hard-coded domains (per-program), not generalisable - by design, OK.
+  * No case / 200-with-redirect handling issue; uses -L redirects correctly.
+  * Missing timeout on PROPFIND/TRACE could hang (curl -m 10 is set, fine).
+[FIX]
+  * Could accept domains via env/file to generalise. Otherwise fine.
+
+--- 9. cleanamass.sh -------------------------------------------------------
+[STATUS] FIX
+[SEVERITY] LOW
+[PROBLEMS]
+  * Runs active `amass enum -d` (not -passive) and dumps to amassoutput.txt in CWD.
+  * Does not sanitise ANSI fully, single-word grep, no uniq after sed.
+  * No --passive, so it's an ACTIVE scan (alert on some programs).
+[FIX]
+  * Use `amass enum -passive`; strip ANSI, sort -u. Generalise output name.
+
+--- 10. cleanurls.sh / urlfilter.sh / reconfilter.sh ------------------------
+[STATUS] PARTIAL (three scripts duplicate each other)
+[SEVERITY] LOW
+[PROBLEMS]
+  * urlfilter.sh and reconfilter.sh filter the SAME way as cleanurls.sh - you
+    have 3 overlapping filters. reconfilter.sh additionally does JS secret scan.
+  * No scoping filter to the target domain (URLs from other assets leak in).
+  * js/parameters/cleaned files overwrite shared names from multiple runs.
+[FIX]
+  * Keep ONE filter script; add `-l target` to restrict by domain/scope.
+  * Use Gf to classify (sqli, xxe, ssti, redirect, rce, potential).
+
+--- 11. commixrecon.sh ------------------------------------------------------
+[STATUS] OK (small, correct)
+[SEVERITY] LOW
+[PROBLEMS]
+  * scans a parameters.txt only, sequential with sleep 5.
+[FIX]
+  * Add --level/--risk flags optional; run in parallel via xargs.
+
+--- 12. crawlrecon.sh --------------------------------------------------------
+[STATUS] PARTIAL
+[SEVERITY] MEDIUM
+[PROBLEMS]
+  * hakrawler+gospider+katana all single threaded and gated to depth 3.
+  * The wordlist is passed only to katana (-wc); hakrawler/gospider don't use it.
+  * No charset filtering/scope restriction; collects off-domain URLs too.
+  * sleep between crawlers adds nothing.
+[FIX]
+  * Add -scope/ -include; use katana as primary, others as alternate. Parallelise.
+
+--- 13. dirrecon.sh ----------------------------------------------------------
+[STATUS] PARTIAL
+[SEVERITY] MEDIUM
+[PROBLEMS]
+  * Runs THREE dir-bruteforcers (ffuf, dirsearch, gobuster) sequentially for the
+    same wordlist - redundant and extremely slow. Pick ffuf (best) + one fallback.
+  * All -t 1 / --delay -> very slow.
+  * Does not apply extension filtering properly; cannot auto-tune wordlist.
+[FIX]
+  * Keep ffuf only, raise -t/-rate, add dynamic wordlist + recursion flag.
+  * Use nafeezwordlist or sec1s dir+bak for better coverage.
+
+--- 14. findrecon.sh ----------------------------------------------------------
+[STATUS] PARTIAL
+[SEVERITY] MEDIUM
+[PROBLEMS]
+  * assetfinder produces new SUBDOMAINS, not URLs; prefixing https:// and feeding
+    into raw is mixing domains with URLs.
+  * xnLinkFinder + urlfinder good but sequential & sleep-gated.
+  * Output written to findurls.txt but fullrecon expects that from jsrecon.
+[FIX]
+  * Use subfinder-style assets to the subdomain set, keep URL finding separate.
+  * Feed into links-from-js (getJS / LinkFinder) properly.
+
+--- 15. hunter.sh -------------------------------------------------------------
+[STATUS] FIX (broken formatting / trap)
+[SEVERITY] HIGH
+[PROBLEMS]
+  * Every line indented with tab => syntax object; trap breaks getopts.
+  * Static tags; -ni (non-interactive) ok; no nuclei binary check.
+[FIX]
+  * Rewrite cleanly; add command -v nuclei; allow custom author/severity; use -stats.
+
+--- 16. jsrecon.sh -------------------------------------------------------------
+[STATUS] PARTIAL
+[SEVERITY] MEDIUM
+[PROBLEMS]
+  * Downloads each JS with plain `curl -s` (no timeout) -> can hang.
+  * Only regex secret scan; no JWT validation, no google maps / slack endpoint extract.
+  * Patterns include generic "secret"/"password" -> heavy false positives.
+[FIX]
+  * Use getJS/LinkFinder + secretfinder/nuclei -tags secrets; add timeout; dedupe.
+
+--- 17. repeater.sh -----------------------------------------------------------
+[STATUS] OK (manual HTTP repeater helper)
+[SEVERITY] LOW
+[PROBLEMS]
+  * Depends on `http` (httpie) and vim - fine if present.
+  * Method/body parsing simplistic (first line only).
+[FIX]
+  * Strongly recommend using burpsuite or `caido` (present at /root/scripts/caido.py)
+    instead; keep only as fallback.
+
+--- 18. smugglerrecon.sh -------------------------------------------------------
+[STATUS] OK (small correct)
+[SEVERITY] LOW
+[PROBLEMS]
+  * Only smuggler tool, sequential.
+[FIX]
+  * Add `prettier`/`http-request-smuggler` nuclei templates; check CL.TE/TE.CL properly.
+
+--- 19. sqlrecon.sh ------------------------------------------------------------
+[STATUS] OK (small)
+[SEVERITY] MEDIUM (sqlmap on ALL param URLs with level2 is slow)
+[PROBLEMS]
+  * default input url.txt (may not exist; check naming).
+  * sqlmap level 2 risk 1 on every URL sequentially; no urls dedupe/filter
+[FIX]
+  * Add --crawl=0, --batch, --threads, --flush-session; prefilter with gf sqli.
+
+--- 20. urlrecon.sh -------------------------------------------------------------
+[STATUS] PARTIAL
+[SEVERITY] MEDIUM
+[PROBLEMS]
+  * gau + waybackurls + paramspider sequential; paramspider only on domain.
+  * No nuclei on the gathered URLs; no tagging by category.
+[FIX]
+  * Parallelise; add waymore (a stronger wayback tool); add urlprobe for live check.
+
+--- 21. xssrecon.sh ------------------------------------------------------------
+[STATUS] PARTIAL
+[SEVERITY] MEDIUM
+[PROBLEMS]
+  * 7 tools sequentially per URL (dalfox, xsstrike, loxs, pwnxss, xspear,
+    xssfinder, xss-automation) - massive duplication and runtime.
+  * dalfox alone (with --waf bypass) covers most; keep dalfox + nuclei xss.
+  * No CSP/headers analysis; no context-aware payloads.
+[FIX]
+  * Keep dalfox as primary; add nuclei httpx-based xss + kxss; remove redundant.
+
+========================================================================
+HIGH-PRIORITY TOOLS TO INSTALL (missing or strongly recommended)
+========================================================================
+ALREADY INSTALLED (good): httpx, dnsx, amass, subfinder, ffuf, alterx, nmap,
+naabu, whatweb, webanalyze, wafw00f, cmseek, wpscan, cmsmap, gau, waybackurls,
+paramspider, katana, hakrawler, gospider, assetfinder, xnLinkFinder, urlfinder,
+dirsearch, gobuster, nuclei, dalfox, xsstrike, xspear, sqlmap, crlfuzz, arjun,
+commix, smuggler, uro, knockpy, sublist3r, haktrails.
+
+MISSING / MUST INSTALL:
+  * puredns          - super fast DNS brute with massdns/masscan backend.
+  * shodan CLI       - host/ips, expo, search - find real IPs behind CDN.
+  * crt.sh via curl  - certificate transparency for subdomains + historical.
+  * waymore          - better wayback collecting than waybackurls.
+  * gf               - classify URLs into sqli/xxe/ssti/redirect/rce.
+  * kxss             - find reflected XSS payload-less.
+  * getJS / LinkFinder - extract endpoints+secrets from JS.
+  * secretfinder     - stronger JS secret extraction.
+  * httpx already; add `nuclei` templates keep updated (nuclei -update-templates).
+  * gospider already; add `hakrawler` already; ok.
+  * ffuf wordlists: /usr/share/wordlists/seclists (install seclists package)
+  * waybackurls already.
+  * anubis+robtex for subs.
+  * tlsx (projectdiscovery) for TLS/JARM fingerprint - correlation to find origin.
+  * ceti/censysapi (optional) for certificate-search to find origin IP.
+  * massdns (backend for puredns).
+  * chaos / env vars for SecurityTrails/Censys/CriminalIP API keys.
+
+========================================================================
+TOOLS BY ATTACK SURFACE (what to add to each script)
+========================================================================
+SUB ENUMERATION:
+  subfinder, amass, crt.sh, anubis, otx, chaos, rapiddns, shodan,
+  puredns+massdns, alterx/gotator mutations, dnsx validation.
+FINDING REAL IP BEHIND CDN:
+  shodan host, censys/cetic, crt.sh SSL history, SecurityTrails, DNSHistory,
+  old-email headers, favicon hash (+shodan), JARM matching (tlsx), cloudfail.
+URL GATHERING / CRAWLING:
+  gau, waymore, waybackurls, katana, hakrawler, gospider, urlfinder, LinkFinder,
+  getJS, paramspider, github-search, dalfox.
+VULNERABILITY SCAN:
+  nuclei (mass templates), dalfox (xss), sqlmap, commix, smuggler, crlfuzz,
+  nim (nuclei templates for specific), nikto (servers), wpscan (wp),
+  cmsmap (other CMS), searchsploit.
+TECH / OSINT:
+  whatweb, webanalyze, wappalyzer, wafw00f, tlsx/jarm, nuclei tech-detect,
+  httpx -json, censys.
+PARAM / API:
+  arjun, parammina, kiterunner (needs install), openredirex, gf classify.
+SMUGGLING / HEADERS:
+  smuggler, http-request-smuggling nuclei, prettier, navi.
+
+========================================================================
+RECOMMENDED OPTIMAL PIPELINE (revised order)
+========================================================================
+1. passivesubrecon (add crt.sh, otx, chaos, rapiddns; amass once; dnsx validate)
+2. brutesubrecon (puredns+massdns backend OR ffuf -t 40; alterx+gotator mutation)
+3. iprecon (use the rewritten version: alive-first, multi-CDN detection,
+   shodan+crt.sh+Sectrails historical IPs, JARM correlation, dedup)
+4. urlrecon (gau+waymore+urlfinder, parallel)
+5. crawlrecon (katana primary + gospider, scope-locked)
+6. findrecon (getJS/LinkFinder/secretfinder on js.txt)
+7. filter (one script; gf classify; produce js.txt/parameters.txt/cleaned)
+8. techrecon (once per IP, OS detection deduped, wpscan flagged)
+9. nmapscan (only on unique real IPs, --top-ports, vuln+auth scripts, not full -p-)
+10. nuclei on all live URLs (broad template set, parallel)
+11. dalfox xss, sqlmap/gf, commix, smuggler (parallel by category)
+12. aggregate all findings into one report txt in an output folder
+
+========================================================================
+END OF REPORT
+========================================================================

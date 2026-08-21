@@ -1,0 +1,331 @@
+========================================================================
+DS RECON SCRIPT SUITE - USER MANUAL
+========================================================================
+Location      : /root/bugscripts/ds*.sh
+Symlinks      : /usr/local/bin/ds* (no .sh), callable globally from anywhere
+Master caller : dsfullrecon
+Environment   : sourced automatically from ~/.bashrc, or manually:
+                  source /root/config/api.env   (loads API keys + PATH)
+
+API keys configured:
+  SECURITYTRAILS_API_KEY  - historical DNS for real-IP / subdomain hunting
+  SHODAN_API_KEY          - host/domain lookups to find origin IPs
+
+NOTE ON RESOURCE USE: this suite is intentionally sequential + single-threaded
+with sleeps and low rates to fit a 1-core/1GB VM and to avoid bot detection on
+targets. Scans are slow but do not crash the box.
+
+========================================================================
+HOW TO RUN THE FULL PIPELINE
+========================================================================
+Global install (symlink) makes every script callable as `ds<name>` from any
+directory. All output is written to the current working directory.
+
+  # Full automated recon (subdomain discovery + all scanners):
+  dsfullrecon example.com \
+      /root/wordlist/shorts/subdomains.txt \
+      /root/wordlist/large.kite \
+      /root/wordlist/shorts/dir.txt
+
+  # Same but only the single domain (no subdomain brute):
+  dsfullrecon --no-subs example.com dir_wordlist.txt
+
+  dsfullrecon creates a timestamped run dir: <domain>_recon_<ts>/ and logs
+  every step (with a timestamp) into recon_steps.txt inside that directory.
+
+========================================================================
+HELP / DOC
+========================================================================
+  dsfullrecon         prints usage + example wordlist paths
+  cat manual.txt      this file
+
+========================================================================
+SCRIPT REFERENCE (alphabetical)
+========================================================================
+Each entry:  command  ->  what it does  ->  key tools  ->  example.
+
+----------------------------------------------------------------------
+dsapirecon  API/parameter discovery + open redirect fuzzing
+  Tools: kiterunner (kr), arjun, qsreplace, oralyzer (py), openredirex
+  Usage: dsapirecon <domain> <subdomains.txt> <kite_wordlist>
+  Example:
+    dsapirecon example.com subdomains.txt /root/wordlist/large.kite
+  Outputs: report.txt, vulnerable_urls.txt
+
+----------------------------------------------------------------------
+dsbrutesubrecon  Active subdomain bruteforce
+  Tools: ffuf, knockpy, alterx
+  Usage: dsbrutesubrecon <domain> <subdomains_wordlist> <subdomains.txt>
+  Example:
+    dsbrutesubrecon example.com /root/wordlist/shorts/subdomains.txt subdomains.txt
+  Note: does NOT resolve; run dsiprecon afterward to validate + get IPs.
+
+----------------------------------------------------------------------
+dsclassifyurls  Split urls.txt into per-vuln-class files
+  Tools: gf (+ patterns), grep
+  Usage: dsclassifyurls <urls.txt> [target_domain]
+  Example: dsclassifyurls urls.txt example.com
+  Outputs: sqli.txt, xxe.txt, ssti.txt, redirect.txt, rce.txt, lfi.txt,
+           idor.txt, ssrf.txt, xss.txt, interestingparams.txt, backup.txt
+  Feed outputs to matching scanners (dalfox xss.txt, sqlmap sqli.txt).
+
+----------------------------------------------------------------------
+dscleanamass  Free/quick passive subdomain dump
+  Tools: amass (-passive), sed, grep
+  Usage: dscleanamass <target> [output]
+  Example: dscleanamass example.com amassoutput.txt
+  Outputs: amassoutput.txt
+
+----------------------------------------------------------------------
+dscleanurls  Clean + dedupe a URL list (wrapper around dsurlfilter)
+  Tools: urlfilter pipeline, uro
+  Usage: dscleanurls <urls.txt> [target_domain]
+  Example: dscleanurls urls.txt example.com
+  Outputs: cleaned urls.txt + js.txt + parameters.txt
+
+----------------------------------------------------------------------
+dscloudpermissions  Cloud storage (S3/Azure/GCS) misconfiguration checks
+  Tools: curl, grep
+  Usage: dscloudpermissions <subdomains.txt|domain>
+  Example: dscloudpermissions subdomains.txt
+  Outputs: cloudreport.txt  (lists public-readable buckets)
+
+----------------------------------------------------------------------
+dscommixrecon  Command injection scan
+  Tools: commix
+  Usage: dscommixrecon <parameters.txt>
+  Example: dscommixrecon parameters.txt
+  Outputs: cmdireport.txt
+
+----------------------------------------------------------------------
+dscrawlrecon  Website crawling for endpoints/links
+  Tools: hakrawler, katana, gospider
+  Usage: dscrawlrecon <domain|domains.txt> <depth> <wordlist.txt>
+  Example: dscrawlrecon subdomains.txt 3 /root/wordlist/shorts/dir.txt
+  Outputs: curls.txt, appends to urls.txt
+
+----------------------------------------------------------------------
+dsdirrecon  Directory + file bruteforce
+  Tools: ffuf (primary), dirsearch + gobuster (fallback)
+  Usage: dsdirrecon <domain> <subdomains.txt> <wordlist.txt>
+  Example: dsdirrecon example.com subdomains.txt /root/wordlist/shorts/dir.txt
+  Outputs: burl.txt
+
+----------------------------------------------------------------------
+dsfindrecon  Find URLs from pages / assetfinder / xnLinkFinder / urlfinder
+  Tools: assetfinder, xnLinkFinder, urlfinder
+  Usage: dsfindrecon <domain|domains.txt>
+  Example: dsfindrecon subdomains.txt
+  Outputs: findurls.txt, appends to urls.txt
+
+----------------------------------------------------------------------
+dsfullrecon  MASTER orchestrator (runs everything sequentially)
+  Tools: all ds scripts
+  Usage:
+    dsfullrecon [--no-subs] <domain> [subs_wordlist] [kite_wordlist] [dir_wordlist]
+  Example:
+    dsfullrecon example.com /root/wordlist/shorts/subdomains.txt /root/wordlist/large.kite /root/wordlist/shorts/dir.txt
+    dsfullrecon --no-subs example.com /root/wordlist/shorts/dir.txt
+  Outputs: <domain>_recon_<ts>/recon_steps.txt + all per-script outputs.
+
+----------------------------------------------------------------------
+dsgitrecon  Exposed VCS/env/backup file discovery
+  Tools: curl, grep
+  Usage: dsgitrecon <subdomains.txt|domain>
+  Example: dsgitrecon subdomains.txt
+  Outputs: gitrecon.txt  (.git/config, .env, backups, etc.)
+  Manually verify hits (avoid SPA 200 fallback false positives).
+
+----------------------------------------------------------------------
+dsgraphqlrecon  GraphQL endpoint discovery + introspection check
+  Tools: curl, jq, grep
+  Usage: dsgraphqlrecon <subdomains.txt|domain>
+  Example: dsgraphqlrecon subdomains.txt
+  Outputs: graphql_report.txt  (introspection-enabled endpoints)
+
+----------------------------------------------------------------------
+dsheaderinject  CRLF / Host-header / open-redirect checks
+  Tools: crlfuzz, curl, gf redirect
+  Usage: dsheaderinject <urls.txt|domain>
+  Example: dsheaderinject urls.txt
+  Outputs: headerinject.txt
+
+----------------------------------------------------------------------
+dshunter  Mass nuclei scan (broad template set)
+  Tools: nuclei
+  Usage: dshunter -d <domain> -l <subdomain_list> -o <output_file>
+  Example:
+    dshunter -d example.com -l subdomains.txt -o nuclei_out.txt
+  Outputs: <output_file>, nuclei_errors.log
+
+----------------------------------------------------------------------
+dsiprecon  Resolve subdomains to real IPs, live-check, filter CDN IPs
+  Tools: httpx, dnsx, curl, hackertarget, crt.sh, SecurityTrails, python3
+  Usage: dsiprecon <subdomains.txt>
+  Example: dsiprecon subdomains.txt
+  Outputs: activesubs.txt, ips.txt, origin_ips.txt
+
+----------------------------------------------------------------------
+dsjsendpoints  Extract JS endpoints, parameters and secrets
+  Tools: getJS, linkfinder, xnLinkFinder, secretfinder, curl
+  Usage: dsjsendpoints <domain|urls.txt>
+  Example: dsjsendpoints urls.txt
+  Outputs: js.txt, endpoints.txt, jsecrets.txt, parameters.txt
+
+----------------------------------------------------------------------
+dsjsrecon  Basic JS secret regex scan of JS files
+  Tools: curl, grep
+  Usage: dsjsrecon <js.txt>
+  Example: dsjsrecon js.txt
+  Outputs: alljs.txt, Findings.txt
+
+----------------------------------------------------------------------
+dsjwtcheck  JWT extraction + alg:none / weak-signature analysis
+  Tools: curl, base64, python3, jq
+  Usage: dsjwtcheck <js.txt|urls.txt|tokens.txt>
+  Example: dsjwtcheck js.txt
+  Outputs: jwt.json, jwtreport.txt
+  Note: prints alg:none PoC; run jwt_tool --crack for weak secrets manually.
+
+----------------------------------------------------------------------
+dsnmapscan  Nmap vulnerability scan on one IP/domain
+  Tools: naabu (pre-scan), nmap (-sV -sC --script vuln)
+  Usage: dsnmapscan <ip-or-domain>
+  Example: dsnmapscan 93.184.216.34
+  Outputs: nmapreport.txt, network.txt
+  Slow/sequential by design (single host at a time).
+
+----------------------------------------------------------------------
+dsoriginip  Find REAL origin IPs behind CDN
+  Tools: shodan, dnsx, crt.sh, hackertarget, SecurityTrails, curl
+  Usage: dsoriginip <domain|subdomains.txt>
+  Example: dsoriginip subdomains.txt
+  Outputs: origin_ips.txt, origin_reasons.txt
+  Filters Cloudflare/AWS/Azure/Fastly/private ranges; keeps origin IPs.
+
+----------------------------------------------------------------------
+dsparalytics  Wayback/archive diffing + live URL filtering
+  Tools: gau, waymore, waybackurls, anew, httpx
+  Usage: dsparalytics <domain|subdomains.txt> [prior_urls.txt]
+  Example: dsparalytics subdomains.txt urls.txt
+  Outputs: new_urls.txt, live_urls.txt
+
+----------------------------------------------------------------------
+dspassivesources  Aggregated passive subdomain recon (API-based)
+  Tools: subfinder, amass(-passive), assetfinder, crt.sh, OTX, anubis,
+         rapiddns, shodan, SecurityTrails, jq
+  Usage: dspassivesources <domain> [subdomains.txt]
+  Example: dspassivesources example.com subdomains.txt
+  Outputs: appended subdomains.txt (uses SECURITYTRAILS_API_KEY)
+
+----------------------------------------------------------------------
+dspassivesubrecon  Passive subdomain recon (amass + subfinder + sublist3r + haktrails)
+  Tools: amass, subfinder, sublist3r, haktrails, dnsx, httpx
+  Usage: dspassivesubrecon <domain|domains.txt> [subdomains.txt]
+  Example: dspassivesubrecon example.com subdomains.txt
+  Outputs: subs.txt, cleanedsubs.txt, validsubs.txt, ips.txt, ipsv6.txt
+
+----------------------------------------------------------------------
+dsreconfilter  Filter URLs + scan JS for secrets
+  Tools: urlfilter pipeline, curl, grep
+  Usage: dsreconfilter <urls.txt> [target_domain]
+  Example: dsreconfilter urls.txt example.com
+  Outputs: js.txt, parameters.txt, cleaned.txt, alljs.txt, Findings.txt, jsecrets.txt
+
+----------------------------------------------------------------------
+dsrepeater  Manual HTTP request/repeater helper (vim-based)
+  Tools: vim, httpie, curl
+  Usage: dsrepeater <url>
+  Example: dsrepeater https://example.com/api/login
+  Opens the request in vim; edits method/body/headers; sends via httpie.
+
+----------------------------------------------------------------------
+dssmugglerrecon  HTTP request smuggling detection
+  Tools: smuggler
+  Usage: dssmugglerrecon <domain|subdomains.txt>
+  Example: dssmugglerrecon subdomains.txt
+  Outputs: smugglerreport.txt
+
+----------------------------------------------------------------------
+dssqlrecon  SQL injection + CRLF detection
+  Tools: sqlmap, crlfuzz
+  Usage: dssqlrecon <parameters.txt|url.txt>
+  Example: dssqlrecon parameters.txt
+  Outputs: sqlreport.txt
+
+----------------------------------------------------------------------
+dstakeover  Subdomain takeover detection
+  Tools: subjack, nuclei (takeover templates), dig
+  Usage: dstakeover <subdomains.txt|domain>
+  Example: dstakeover subdomains.txt
+  Outputs: takeover.txt  (CNAME candidates + nuclei hits)
+
+----------------------------------------------------------------------
+dstechrecon  Tech-stack fingerprinting + port/service detection
+  Tools: naabu, nmap (-sV -sC), whatweb, webanalyze, wafw00f, httpx,
+         cmseek, wpscan, cmsmap
+  Usage: dstechrecon <ips.txt|subdomains.txt>
+  Example: dstechrecon ips.txt
+  Outputs: tech.txt, techstack.txt  (OS, confirmed tools, ports, CMS)
+
+----------------------------------------------------------------------
+dsurlfilter  Filter a URL list into js/parameters/cleaned/interesting
+  Tools: grep, uro
+  Usage: dsurlfilter <urls.txt> [target_domain]
+  Example: dsurlfilter urls.txt example.com
+  Outputs: js.txt, parameters.txt, cleaned.txt, interesting.txt
+  (optional scope filter: only URLs containing target_domain)
+
+----------------------------------------------------------------------
+dsurlrecon  Gather URLs from archives (gau/wayback/paramspider)
+  Tools: gau, waybackurls, paramspider, httpx
+  Usage: dsurlrecon <domain> [-l subdomains.txt]
+  Example: dsurlrecon example.com -l subdomains.txt
+  Outputs: urls.txt, js.txt, parameters.txt
+
+----------------------------------------------------------------------
+dswebrecon  Web security headers / WAF / TLS / tech audit
+  Tools: curl, wafw00f, httpx, tlsx
+  Usage: dswebrecon <subdomains.txt|domain>
+  Example: dswebrecon subdomains.txt
+  Outputs: webrecon.txt, waf.txt, headers.txt, techsummary.txt
+  Flags MISSING security headers + cookie flags (HttpOnly/Secure).
+
+----------------------------------------------------------------------
+dsxssrecon  XSS scan on parameterized URLs
+  Tools: dalfox, xsstrike, loxs, pwnxss, xspear, xssfinder, xss-automation
+  Usage: dsxssrecon <parameters.txt> [payload_list.txt]
+  Example: dsxssrecon parameters.txt
+  Example: dsxssrecon parameters.txt mypayloads.txt
+  Outputs: xssreport.txt
+
+========================================================================
+RECOMMENDED WORKFLOW (done in order by dsfullrecon)
+========================================================================
+1. passive subdomains         -> dspassivesubrecon + dspassivesources
+2. active brute               -> dsbrutesubrecon (needs wordlist)
+3. resolve + live check + CDN -> dsiprecon
+4. find origin IPs            -> dsoriginip
+5. tech/WAF/headers           -> dstechrecon + dswebrecon
+6. nmap on real IPs           -> dsnmapscan
+7. takeover                   -> dstakeover
+8. gather URLs                -> dsurlrecon + dsparalytics + dscrawlrecon + dsdirrecon
+9. JS endpoints/secrets       -> dsjsendpoints + dsfindrecon
+10. filter + classify         -> dsurlfilter + dsclassifyurls
+11. specific bug classes      -> dsgitrecon, dsgraphqlrecon, dscloudpermissions,
+                                 dsheaderinject, dsjwtcheck
+12. injection scans           -> dsxssrecon, dssqlrecon, dscommixrecon,
+                                 dssmugglerrecon
+
+========================================================================
+TIPS
+========================================================================
+- Run inside a fresh directory so outputs are contained.
+- dsfullrecon already isolates each run into <domain>_recon_<ts>/.
+- Set API keys once via /root/config/api.env (source it) or add to ~/.bashrc
+  (already present).
+- Wordlist examples shown in dsfullrecon usage; adjust to your local paths.
+- Tools missing from PATH are skipped gracefully with a warning, never crash.
+========================================================================
+END OF MANUAL
+========================================================================
